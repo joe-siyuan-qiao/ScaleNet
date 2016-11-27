@@ -1,12 +1,3 @@
---[[----------------------------------------------------------------------------
-Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-This source code is licensed under the BSD-style license found in the
-LICENSE file in the root directory of this source tree. An additional grant
-of patent rights can be found in the PATENTS file in the same directory.
-
-Train DeepMask or SharpMask
-------------------------------------------------------------------------------]]
-
 require 'torch'
 require 'cutorch'
 
@@ -21,7 +12,7 @@ cmd:option('-rundir', 'exps/', 'experiments directory')
 cmd:option('-datadir', 'data/', 'data directory')
 cmd:option('-seed', 1, 'manually set RNG seed')
 cmd:option('-gpu', 1, 'gpu device')
-cmd:option('-nthreads', 4, 'number of threads for DataSampler')
+cmd:option('-nthreads', 2, 'number of threads for DataSampler')
 cmd:option('-reload', '', 'reload a network from given directory')
 cmd:text()
 cmd:text('Training Options:')
@@ -40,6 +31,9 @@ cmd:option('-scale', .25, 'scale jitter allowed')
 cmd:option('-hfreq', 0.5, 'mask/score head sampling frequency')
 cmd:option('-scratch', false, 'train DeepMask with randomly initialize weights')
 cmd:option('-reloadepoch', 1, 'the starting epoch for reloading')
+cmd:option('-ti', 0.01, 'initial threshold')
+cmd:option('-te', 0.2, 'final threshold')
+cmd:option('-ts', 0.01, 'threshold step')
 cmd:text()
 cmd:text('SharpMask Options:')
 cmd:option('-dm', '', 'path to trained deepmask (if dm, then train SharpMask)')
@@ -47,8 +41,9 @@ cmd:option('-km', 32, 'km')
 cmd:option('-ks', 32, 'ks')
 
 local config = cmd:parse(arg)
-configreloadepoch = config.reloadepoch or 1
-confignthreads = config.nthreads or 2
+local configreloadepoch = config.reloadepoch or 1
+local confignthreads = config.nthreads or 2
+local configti, configte, configts = config.ti, config.te, config.ts
 
 --------------------------------------------------------------------------------
 -- various initializations
@@ -64,65 +59,52 @@ if #config.dm > 0 then
   config.gSz = config.iSz -- in sharpmask, ground-truth has same dim as input
 end
 
-paths.dofile('DeepMask.lua')
-if trainSm then paths.dofile('SharpMask.lua') end
+paths.dofile('ScaleNet.lua')
 
 --------------------------------------------------------------------------------
 -- reload?
 local epoch, model
 local reloadpath = config.reload
-if #config.reload > 0 then
-  epoch = 0
-  if paths.filep(config.reload..'/log') then
-    for line in io.lines(config.reload..'/log') do
-      if string.find(line,'train') then epoch = epoch + 1 end
-    end
-  end
-  print(string.format('| reloading experiment %s', config.reload))
-  local m = torch.load(string.format('%s/model.t7', config.reload))
-  model, config = m.model, m.config
-end
+local model = torch.load(string.format(config.reload))
+model = model.model
 -- config.reload = reloadpath
 config.nthreads = confignthreads
 
 --------------------------------------------------------------------------------
 -- directory to save log and model
-local pathsv = trainSm and 'sharpmask/exp' or 'deepmask/exp'
-config.rundir = cmd:string(
-  paths.concat(config.reload=='' and config.rundir or config.reload, pathsv),
-  config,{rundir=true, gpu=true, reload=true, datadir=true, dm=true} --ignore
-)
-
+local pathsv = 'scalenet/exp'
+-- config.rundir = cmd:string(
+--   paths.concat(config.reload=='' and config.rundir or config.reload, pathsv),
+--   config,{rundir=true, gpu=true, reload=true, datadir=true, dm=true} --ignore
+-- )
+config.rundir = paths.concat(config.rundir, pathsv)
 print(string.format('| running in directory %s', config.rundir))
 os.execute(string.format('mkdir -p %s',config.rundir))
 
 --------------------------------------------------------------------------------
 -- network and criterion
-model = model or (trainSm and nn.SharpMask(config) or nn.DeepMask(config))
-local criterion = nn.SoftMarginCriterion():cuda()
+-- model = model or nn.ScaleNet(config)
+local criterion = nn.DistKLDivCriterion():cuda()
 
 --------------------------------------------------------------------------------
 -- initialize data loader
-local DataLoader = paths.dofile('DataLoader.lua')
+local DataLoader = paths.dofile('ScaleAwareDataLoaderOneThread.lua')
 local trainLoader, valLoader = DataLoader.create(config)
 
 --------------------------------------------------------------------------------
--- initialize Trainer (handles training/testing loop)
-if trainSm then
-  paths.dofile('TrainerSharpMask.lua')
-else
-  paths.dofile('TrainerDeepMask.lua')
+-- create threshold table
+config.logprobthres = {}
+for thres = configti, configte, configts do
+  table.insert(config.logprobthres, thres)
 end
-local trainer = Trainer(model, criterion, config)
+
+--------------------------------------------------------------------------------
+-- initialize Trainer (handles training/testing loop)
+paths.dofile('TesterScaleNet.lua')
+local tester = Tester(model, criterion, config)
 
 --------------------------------------------------------------------------------
 -- do it
 epoch = configreloadepoch
-print('| start training')
-for i = 1, config.maxepoch do
-  if i == 1 then print ('Start training from epoch ' .. epoch) end
-  trainer:train(epoch,trainLoader)
-  -- if i == 1 then trainer:test(epoch, valLoader) end
-  if i%2 == 0 then trainer:test(epoch,valLoader) end
-  epoch = epoch + 1
-end
+print('| start testing')
+tester:test(epoch,valLoader)

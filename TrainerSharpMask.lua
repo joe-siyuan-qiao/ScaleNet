@@ -64,6 +64,7 @@ function Trainer:train(epoch, dataloader)
     string.format('[train] | epoch %05d | s/batch %04.2f | loss: %07.5f ',
       epoch, timer:time().real/dataloader:size(),self.lossmeter:value())
   print(logepoch)
+  io.stdout:flush()
   self.log:writeString(string.format('%s\n',logepoch))
   self.log:synchronize()
 
@@ -114,6 +115,7 @@ function Trainer:test(epoch, dataloader)
       self.maskmeter:value('0.5'), self.maskmeter:value('0.7'),
       bestmodel and '*' or 'x')
   print(logepoch)
+  io.stdout:flush()
   self.log:writeString(string.format('%s\n',logepoch))
   self.log:synchronize()
 

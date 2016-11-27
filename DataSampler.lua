@@ -65,8 +65,10 @@ local function log2(x) return math.log(x)/math.log(2) end
 -- image k
 function DataSampler:createBBstruct(objSz,scale)
   local bbStruct = tds.Vec()
+  local imgFreq = {}
 
   for i = 1, self.nImages do
+    local bbsCnt = 0
     local annIds = self.coco:getAnnIds({imgId=self.imgIds[i]})
     local bbs = {scales = {}}
     if annIds:dim() ~= 0 then
@@ -86,15 +88,46 @@ function DataSampler:createBBstruct(objSz,scale)
               bbs[ss] = {}; table.insert(bbs.scales,ss)
             end
             table.insert(bbs[ss],{xcS,ycS,category_id=ann.category})
+            bbsCnt = bbsCnt + 1
             break
           end
         end
       end
     end
     bbStruct:insert(tds.Hash(bbs))
+    table.insert(imgFreq, bbsCnt)
   end
   collectgarbage()
   self.bbStruct = bbStruct
+
+  -- create image sampling mapping for score branch sampling
+  local imgSmpMapSize = torch.Tensor(imgFreq):sum()
+  local imgSmpMap = torch.LongTensor(imgSmpMapSize):zero()
+  local currentPt = 1
+  for imgIdx = 1, #imgFreq do
+    if imgFreq[imgIdx] > 0 then
+      imgSmpMap:narrow(1, currentPt, imgFreq[imgIdx]):fill(imgIdx)
+    end
+    currentPt = currentPt + imgFreq[imgIdx]
+  end
+  self.imgSmpMap = imgSmpMap
+
+  -- create category sampling mapping for mask branch sampling
+  local catFreq = {}
+  for i = 1, 80 do
+    local catId = self.catIds[i]
+    table.insert(catFreq, self.coco:getAnnIds({catId=catId}):size(1))
+  end
+  local catSmpMapSize = torch.Tensor(catFreq):sum()
+  local catSmpMap = torch.LongTensor(catSmpMapSize):zero()
+  currentPt = 1
+  for catIdx = 1, 80 do
+    if catFreq[catIdx] > 0 then
+      catSmpMap:narrow(1, currentPt, catFreq[catIdx]):fill(catIdx)
+    end
+    currentPt = currentPt + catFreq[catIdx]
+  end
+  self.catSmpMap = catSmpMap
 end
 
 --------------------------------------------------------------------------------
@@ -129,7 +162,8 @@ end
 function DataSampler:maskSampling()
   local iSz,wSz,gSz = self.iSz,self.wSz,self.gSz
 
-  local cat,ann = torch.random(80)
+  local cat,ann = torch.random(self.catSmpMap:size(1))
+  cat = self.catSmpMap[cat]
   while not ann or ann.iscrowd == 1 or ann.area < 100 or ann.bbox[3] < 5
     or ann.bbox[4] < 5 do
       local catId = self.catIds[cat]
@@ -163,7 +197,8 @@ local imgPad = torch.Tensor()
 function DataSampler:scoreSampling(cat,imgId)
   local idx,bb
   repeat
-    idx = torch.random(1,self.nImages)
+    idx = torch.random(1,self.imgSmpMap:size(1))
+    idx = self.imgSmpMap[idx]
     bb = self.bbStruct[idx]
   until #bb.scales ~= 0
 

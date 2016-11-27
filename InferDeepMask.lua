@@ -37,8 +37,9 @@ Infer.__init = argcheck{
   {name="iSz", type="number", default=160},
   {name="dm", type="boolean", default=true},
   {name="timer", type="boolean", default=false},
+  {name="lowmemmode", type="boolean", default=true},
   call =
-    function(self, np, scales, meanstd, model, iSz, dm, timer)
+    function(self, np, scales, meanstd, model, iSz, dm, timer, lowmemmode)
       --model
       self.trunk = model.trunk
       self.mHead = model.maskBranch
@@ -67,6 +68,8 @@ Infer.__init = argcheck{
       -- allocate topScores and topMasks
       self.topScores = torch.Tensor()
       self.topMasks = torch.ByteTensor()
+
+      self.lowmemmode = lowmemmode
     end
 }
 
@@ -97,16 +100,36 @@ function Infer:forward(input)
 
     -- forward trunk
     if self.timer then sys.tic() end
-    local outTrunk = self.trunk:forward(inpPad):squeeze()
+    local outTrunk
+    if self.lowmemmode == false then
+      outTrunk = self.trunk:forward(inpPad):squeeze()
+    else
+      local trunkMod = self.trunk.modules
+      outTrunk = inpPad:clone():cuda()
+      for modIdx = 1, #trunkMod do
+        local subnet = nn.Sequential()
+        subnet:add(trunkMod[modIdx])
+        subnet:cuda()
+        outTrunk = subnet:forward(outTrunk:cuda())
+        cutorch.synchronize()
+        outTrunk = outTrunk:float()
+        subnet:clearState()
+        subnet = nil
+        collectgarbage()
+      end
+      outTrunk = outTrunk:squeeze()
+    end
     cutorch.synchronize()
     if self.timer then self.timer:narrow(1,3,1):add(sys.toc()) end
 
     -- forward score branch
+    if self.lowmemmode == true then outTrunk = outTrunk:cuda() end
     if self.timer then sys.tic() end
     local outScore = self.sHead:forward(outTrunk)
     cutorch.synchronize()
     if self.timer then self.timer:narrow(1,4,1):add(sys.toc()) end
     table.insert(outPyramidScore,outScore:clone():squeeze())
+    -- self.sHead:clearState()
 
     -- forward mask branch
     if self.timer then sys.tic() end
@@ -114,6 +137,9 @@ function Infer:forward(input)
     cutorch.synchronize()
     if self.timer then self.timer:narrow(1,5,1):add(sys.toc()) end
     table.insert(outPyramidMask,outMask:float():squeeze())
+    -- self.mHead:clearState()
+
+    -- collectgarbage()
   end
 
   self.mask = unfoldMasksMatrix(outPyramidMask)
@@ -134,7 +160,11 @@ function Infer:getTopScores()
 
   -- sort scores/ids for each scale
   local nScales=#self.scales
-  local rowN=self.score[nScales]:size(1)*self.score[nScales]:size(2)
+  local rowN = 0
+  for s = 1, nScales do
+    rowN = math.max(rowN, self.score[s]:size(1) * self.score[s]:size(2))
+  end
+  -- local rowN=self.score[nScales]:size(1)*self.score[nScales]:size(2)
   sortedScores:resize(rowN,nScales):zero()
   sortedIds:resize(rowN,nScales):zero()
   for s = 1,nScales do

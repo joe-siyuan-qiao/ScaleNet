@@ -100,10 +100,24 @@ function Infer:forward(input,id)
 
     -- forward trunk
     if self.timer then sys.tic() end
-    local outTrunk = self.trunk:forward(inpPad)
+    local outTrunk
+    local trunkMod = self.trunk.modules
+    outTrunk = inpPad:clone():cuda()
+    for modIdx = 1, #trunkMod do
+      local subnet = nn.Sequential()
+      subnet:add(trunkMod[modIdx])
+      subnet:cuda()
+      outTrunk = subnet:forward(outTrunk:cuda())
+      cutorch.synchronize()
+      outTrunk = outTrunk:float()
+      subnet:clearState()
+      subnet = nil
+      collectgarbage()
+    end
+    outTrunk = outTrunk:cuda()
     cutorch.synchronize()
-    if self.timer then self.timer:narrow(1,3,1):add(sys.toc()) end
     table.insert(outPyramidTrunk,outTrunk:clone():squeeze())
+
 
     -- forward score branch
     if self.timer then sys.tic() end
@@ -112,12 +126,26 @@ function Infer:forward(input,id)
     if self.timer then self.timer:narrow(1,4,1):add(sys.toc()) end
     table.insert(outPyramidScore,outScore:clone():squeeze())
 
+
     -- forward horizontal nets
     if not self.dm then
       local hOuts = {}
       for k,neth in pairs(self.neths) do
         if self.timer then sys.tic() end
-        neth:forward(self.trunk.modules[self.skpos[k]].output)
+        outTrunk = inpPad:clone():cuda()
+        for modIdx = 1, self.skpos[k] do
+          local subnet = nn.Sequential()
+          subnet:add(trunkMod[modIdx])
+          subnet:cuda()
+          outTrunk = subnet:forward(outTrunk:cuda())
+          cutorch.synchronize()
+          outTrunk = outTrunk:float()
+          subnet:clearState()
+          subnet = nil
+          collectgarbage()
+        end
+        outTrunk = outTrunk:cuda()
+        neth:forward(outTrunk)
         cutorch.synchronize()
         if self.timer then self.timer:narrow(1,5,1):add(sys.toc()) end
         hOuts[k] = neth.output:clone()
@@ -231,7 +259,11 @@ function Infer:getTopScores(outPyramidScore)
   local np = self.np
   -- sort scores/ids for each scale
   local nScales=#self.score
-  local rowN=self.score[nScales]:size(1)*self.score[nScales]:size(2)
+  local rowN = 0
+  for s = 1, nScales do
+    rowN = math.max(rowN, self.score[s]:size(1) * self.score[s]:size(2))
+  end
+  -- local rowN=self.score[nScales]:size(1)*self.score[nScales]:size(2)
   sortedScores:resize(rowN,nScales):zero()
   sortedIds:resize(rowN,nScales):zero()
   for s = 1,nScales do
@@ -244,6 +276,11 @@ function Infer:getTopScores(outPyramidScore)
     local sS,sIds=torch.sort(sc,true)
     local sz = sS:size(1)
     sortedScores:narrow(2,s,1):narrow(1,1,sz):copy(sS)
+    local scalethres = 350
+    if sz > scalethres then
+      sortedScores:narrow(2,s,1):narrow(1,scalethres+1,
+      sz-scalethres):zero()
+    end
     sortedIds:narrow(2,s,1):narrow(1,1,sz):copy(sIds)
   end
 
@@ -254,7 +291,9 @@ function Infer:getTopScores(outPyramidScore)
 
   for i = 1,np do
     local scale,score = 0,0
-    for k = 1,nScales do
+    local startScale = 1
+    if i < 61 then startScale = 4 end
+    for k = startScale,nScales do
       if sortedScores[pos[k]][k] > score then
         score = sortedScores[pos[k]][k]
         scale = k

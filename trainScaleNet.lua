@@ -1,12 +1,3 @@
---[[----------------------------------------------------------------------------
-Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-This source code is licensed under the BSD-style license found in the
-LICENSE file in the root directory of this source tree. An additional grant
-of patent rights can be found in the PATENTS file in the same directory.
-
-Train DeepMask or SharpMask
-------------------------------------------------------------------------------]]
-
 require 'torch'
 require 'cutorch'
 
@@ -21,7 +12,7 @@ cmd:option('-rundir', 'exps/', 'experiments directory')
 cmd:option('-datadir', 'data/', 'data directory')
 cmd:option('-seed', 1, 'manually set RNG seed')
 cmd:option('-gpu', 1, 'gpu device')
-cmd:option('-nthreads', 4, 'number of threads for DataSampler')
+cmd:option('-nthreads', 2, 'number of threads for DataSampler')
 cmd:option('-reload', '', 'reload a network from given directory')
 cmd:text()
 cmd:text('Training Options:')
@@ -64,8 +55,7 @@ if #config.dm > 0 then
   config.gSz = config.iSz -- in sharpmask, ground-truth has same dim as input
 end
 
-paths.dofile('DeepMask.lua')
-if trainSm then paths.dofile('SharpMask.lua') end
+paths.dofile('ScaleNet.lua')
 
 --------------------------------------------------------------------------------
 -- reload?
@@ -87,7 +77,7 @@ config.nthreads = confignthreads
 
 --------------------------------------------------------------------------------
 -- directory to save log and model
-local pathsv = trainSm and 'sharpmask/exp' or 'deepmask/exp'
+local pathsv = 'scalenet/exp'
 config.rundir = cmd:string(
   paths.concat(config.reload=='' and config.rundir or config.reload, pathsv),
   config,{rundir=true, gpu=true, reload=true, datadir=true, dm=true} --ignore
@@ -98,21 +88,17 @@ os.execute(string.format('mkdir -p %s',config.rundir))
 
 --------------------------------------------------------------------------------
 -- network and criterion
-model = model or (trainSm and nn.SharpMask(config) or nn.DeepMask(config))
-local criterion = nn.SoftMarginCriterion():cuda()
+model = model or nn.ScaleNet(config)
+local criterion = nn.DistKLDivCriterion():cuda()
 
 --------------------------------------------------------------------------------
 -- initialize data loader
-local DataLoader = paths.dofile('DataLoader.lua')
+local DataLoader = paths.dofile('ScaleAwareDataLoaderOneThread.lua')
 local trainLoader, valLoader = DataLoader.create(config)
 
 --------------------------------------------------------------------------------
 -- initialize Trainer (handles training/testing loop)
-if trainSm then
-  paths.dofile('TrainerSharpMask.lua')
-else
-  paths.dofile('TrainerDeepMask.lua')
-end
+paths.dofile('TrainerScaleNet.lua')
 local trainer = Trainer(model, criterion, config)
 
 --------------------------------------------------------------------------------
@@ -120,9 +106,10 @@ local trainer = Trainer(model, criterion, config)
 epoch = configreloadepoch
 print('| start training')
 for i = 1, config.maxepoch do
+  -- if i == 1 then trainer:test(epoch, valLoader) end
   if i == 1 then print ('Start training from epoch ' .. epoch) end
   trainer:train(epoch,trainLoader)
-  -- if i == 1 then trainer:test(epoch, valLoader) end
-  if i%2 == 0 then trainer:test(epoch,valLoader) end
+  if i == 1 then trainer:test(epoch, valLoader) end
+  if i%20 == 0 then trainer:test(epoch,valLoader) end
   epoch = epoch + 1
 end

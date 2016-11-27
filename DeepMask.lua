@@ -142,6 +142,9 @@ end
 --------------------------------------------------------------------------------
 -- function: to float
 function DeepMask:float()
+  cudnn.convert(self.trunk, nn)
+  cudnn.convert(self.scoreBranch, nn)
+  cudnn.convert(self.maskBranch, nn)
   self.trunk:float(); self.scoreBranch:float(); self.maskBranch:float()
 end
 

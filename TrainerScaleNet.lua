@@ -1,10 +1,5 @@
 --[[----------------------------------------------------------------------------
-Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-This source code is licensed under the BSD-style license found in the
-LICENSE file in the root directory of this source tree. An additional grant
-of patent rights can be found in the PATENTS file in the same directory.
-
-Training and testing loop for DeepMask
+Training and testing loop for ScaleNet
 ------------------------------------------------------------------------------]]
 
 local optim = require 'optim'
@@ -18,12 +13,11 @@ function Trainer:__init(model, criterion, config)
   -- training params
   self.config = config
   self.model = model
-  self.maskNet = nn.Sequential():add(model.trunk):add(model.maskBranch)
-  self.scoreNet = nn.Sequential():add(model.trunk):add(model.scoreBranch)
+  self.scaleNet = nn.Sequential():add(model.trunk):add(model.scaleBranch)
   self.criterion = criterion
   self.lr = config.lr
-  self.optimState ={}
-  for k,v in pairs({'trunk','mask','score'}) do
+  self.optimState = {}
+  for k,v in pairs({'trunk', 'scale'}) do
     self.optimState[v] = {
       learningRate = config.lr,
       learningRateDecay = 0,
@@ -34,20 +28,18 @@ function Trainer:__init(model, criterion, config)
   end
 
   -- params and gradparams
-  self.pt,self.gt = model.trunk:getParameters()
-  self.pm,self.gm = model.maskBranch:getParameters()
-  self.ps,self.gs = model.scoreBranch:getParameters()
+  self.pt, self.gt = model.trunk:getParameters()
+  self.ps, self.gs = model.scaleBranch:getParameters()
 
   -- allocate cuda tensors
   self.inputs, self.labels = torch.CudaTensor(), torch.CudaTensor()
 
   -- meters
-  self.lossmeter  = LossMeter()
-  self.maskmeter  = IouMeter(0.5,config.testmaxload*config.batch)
-  self.scoremeter = BinaryMeter()
+  self.lossmeter = LossMeter()
 
   -- log
-  self.modelsv = {model=model:clone('weight', 'bias'),config=config}
+  self.modelsv = {model=model:clone('weight', 'bias', 'running_mean',
+    'running_var'), config=config}
   self.rundir = config.rundir
   self.log = torch.DiskFile(self.rundir .. '/log', 'rw'); self.log:seekEnd()
 end
@@ -62,31 +54,23 @@ function Trainer:train(epoch, dataloader)
   local timer = torch.Timer()
 
   local fevaltrunk = function() return self.model.trunk.output, self.gt end
-  local fevalmask  = function() return self.criterion.output,   self.gm end
-  local fevalscore = function() return self.criterion.output,   self.gs end
+  local fevalscale = function() return self.criterion.output, self.gs end
 
   local collectgarbagecount = 0
-  
   for n, sample in dataloader:run() do
     -- copy samples to the GPU
     self:copySamples(sample)
 
     -- forward/backward
     local model, params, feval, optimState
-    if sample.head == 1 then
-      model, params = self.maskNet, self.pm
-      feval,optimState = fevalmask, self.optimState.mask
-    else
-      model, params = self.scoreNet, self.ps
-      feval,optimState = fevalscore, self.optimState.score
-    end
+    model, params = self.scaleNet, self.ps
+    feval, optimState = fevalscale, self.optimState.scale
 
-    local outputs = model:forward(self.inputs)
+    local outputs= model:forward(self.inputs)
     local lossbatch = self.criterion:forward(outputs, self.labels)
-
     model:zeroGradParameters()
     local gradOutputs = self.criterion:backward(outputs, self.labels)
-    if sample.head == 1 then gradOutputs:mul(self.inputs:size(1)) end
+    gradOutputs:mul(self.inputs:size(1))
     model:backward(self.inputs, gradOutputs)
 
     -- optimize
@@ -97,10 +81,9 @@ function Trainer:train(epoch, dataloader)
     self.lossmeter:add(lossbatch)
 
     collectgarbagecount = collectgarbagecount + 1
-    
     if collectgarbagecount == 100 then
-        collectgarbagecount = 0
-        collectgarbage()
+      collectgarbagecount = 0
+      collectgarbage()
     end
   end
 
@@ -127,36 +110,31 @@ end
 local maxacc = 0
 function Trainer:test(epoch, dataloader)
   self.model:evaluate()
-  self.maskmeter:reset()
-  self.scoremeter:reset()
-
-  local collectgarbagecount = 0
-
+  local iouSum, numRecord = 0.0, 0
   for n, sample in dataloader:run() do
-    -- copy input and target to the GPU
     self:copySamples(sample)
-
-    if sample.head == 1 then
-      local outputs = self.maskNet:forward(self.inputs)
-      self.maskmeter:add(outputs:view(self.labels:size()),self.labels)
-    else
-      local outputs = self.scoreNet:forward(self.inputs)
-      self.scoremeter:add(outputs, self.labels)
-    end
+    local outputs = self.scaleNet:forward(self.inputs)
     cutorch.synchronize()
-
-    collectgarbagecount = collectgarbagecount + 1
-
-    if collectgarbagecount == 100 then
-        collectgarbagecount = 0
-        collectgarbage()
+    local resizedOutputs = outputs:view(self.labels:size())
+    for i = 1, self.labels:size(1) do
+      numRecord = numRecord + 1
+      local label = self.labels[i]
+      local pred = resizedOutputs[i]
+      local unioncnt = 0
+      local intercnt = 0
+      for j = 1, 65 do
+        local haslabel = label[j] > 0
+        local haspred = pred[j] > -4.6051701859881 -- log(0.01)
+        if haslabel and haspred then intercnt = intercnt + 1 end
+        if haslabel or haspred then unioncnt = unioncnt + 1 end
+      end
+      iouSum = iouSum + intercnt / unioncnt
     end
-
   end
   self.model:training()
 
   -- check if bestmodel so far
-  local z,bestmodel = self.maskmeter:value('0.7')
+  local z,bestmodel = iouSum / numRecord
   if z > maxacc then
     torch.save(string.format('%s/bestmodel.t7', self.rundir),self.modelsv)
     maxacc = z
@@ -166,12 +144,8 @@ function Trainer:test(epoch, dataloader)
   -- write log
   local logepoch =
     string.format('[test]  | epoch %05d '..
-      '| IoU: mean %06.2f median %06.2f suc@.5 %06.2f suc@.7 %06.2f '..
-      '| acc %06.2f | bestmodel %s',
-      epoch,
-      self.maskmeter:value('mean'),self.maskmeter:value('median'),
-      self.maskmeter:value('0.5'), self.maskmeter:value('0.7'),
-      self.scoremeter:value(), bestmodel and '*' or 'x')
+      '| mean iou: %.6f | bestmodel %s',
+      epoch, z, bestmodel and '*' or 'x')
   print(logepoch)
   self.log:writeString(string.format('%s\n',logepoch))
   self.log:synchronize()
@@ -193,7 +167,8 @@ function Trainer:updateScheduler(epoch)
     local regimes = {
       {   1,  50, 1e-3, 5e-4},
       {  51, 120, 5e-4, 5e-4},
-      { 121, 1e8, 1e-4, 5e-4}
+      { 121, 175, 1e-4, 5e-4},
+      { 176, 1e8, 1e-5, 5e-4}
     }
 
     for _, row in ipairs(regimes) do

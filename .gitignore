@@ -1,4 +1,12 @@
 .DS_Store
 pretrained/
 data/
+data
 exps/
+res.jpg
+intermediate/
+tmp.*
+*.log
+exps*/
+pretrained
+*.sh
